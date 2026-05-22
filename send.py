@@ -401,21 +401,33 @@ def fetch_inbox(
     channel_limit: int = 50,
     history_limit: int = 50,
     include_self: bool = False,
+    progress: bool = False,
 ) -> list[dict]:
     """Walk recent IMs, scan history for screamingface:v1 envelopes.
 
-    Returns a list of {channel, ts, sender, envelope} dicts. Excludes
-    envelopes the authenticated user sent themselves unless include_self=True.
+    One client.counts + one conversations.history per channel — no
+    redundant frequency-counting pass. Excludes envelopes the
+    authenticated user sent themselves unless include_self=True.
     """
     me = slack_call("auth.test", token, cookie)
     if not me.get("ok"):
         raise RuntimeError(f"auth.test failed: {me.get('error')}")
     my_user_id = me.get("user_id")
 
-    corresponders = recent_corresponders(token, cookie, target_count=channel_limit)
+    counts = slack_call("client.counts", token, cookie)
+    if not counts.get("ok"):
+        raise RuntimeError(f"client.counts failed: {counts.get('error')}")
+    ims = counts.get("ims", [])
+    ims.sort(key=lambda x: float(x.get("latest") or 0), reverse=True)
+    ims = ims[:channel_limit]
+
     found = []
-    for c in corresponders:
-        channel = c["channel_id"]
+    for i, im in enumerate(ims):
+        channel = im.get("id")
+        if not channel:
+            continue
+        if progress:
+            print(f"  scanning {i + 1}/{len(ims)}  {channel}", flush=True)
         h = slack_call(
             "conversations.history", token, cookie,
             {"channel": channel, "limit": str(history_limit)},
@@ -492,6 +504,7 @@ def cli_inbox(args: argparse.Namespace) -> int:
         channel_limit=args.channels,
         history_limit=args.history,
         include_self=args.include_self,
+        progress=not args.quiet,
     )
 
     state = _load_inbox_state()
@@ -572,6 +585,8 @@ def main(argv: list[str] | None = None) -> int:
                          help="include envelopes you sent (default: skipped)")
     p_inbox.add_argument("--show-known", action="store_true",
                          help="also list already-seen envelopes (default: just new ones)")
+    p_inbox.add_argument("--quiet", action="store_true",
+                         help="suppress per-channel progress output")
     p_inbox.set_defaults(func=cli_inbox)
 
     p_whoami = sub.add_parser("whoami", help="print authenticated Slack identity")
