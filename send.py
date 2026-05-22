@@ -398,56 +398,61 @@ def fetch_inbox(
     token: str,
     cookie: str,
     *,
-    channel_limit: int = 50,
-    history_limit: int = 50,
+    max_results: int = 100,
     include_self: bool = False,
-    progress: bool = False,
+    since_days: int | None = None,
 ) -> list[dict]:
-    """Walk recent IMs, scan history for screamingface:v1 envelopes.
+    """Find screamingface:v1 envelopes via Slack's `search.messages` API.
 
-    One client.counts + one conversations.history per channel — no
-    redundant frequency-counting pass. Excludes envelopes the
-    authenticated user sent themselves unless include_self=True.
+    One API call instead of iterating every IM. Server-side filters on
+    the exact-phrase `"screamingface:v1"` marker and sorts by message
+    timestamp descending.
+
+    Caveat: Slack's search index has 10-60s lag, so envelopes posted in
+    the last minute may not appear yet. The Stop hook (step 4) will pick
+    them up on a subsequent Claude turn anyway.
+
+    Args:
+        max_results: cap on matches returned (Slack max per page is 100).
+        include_self: include envelopes you sent yourself (default: skip).
+        since_days: only return envelopes from the last N days (server-side filter).
     """
     me = slack_call("auth.test", token, cookie)
     if not me.get("ok"):
         raise RuntimeError(f"auth.test failed: {me.get('error')}")
     my_user_id = me.get("user_id")
 
-    counts = slack_call("client.counts", token, cookie)
-    if not counts.get("ok"):
-        raise RuntimeError(f"client.counts failed: {counts.get('error')}")
-    ims = counts.get("ims", [])
-    ims.sort(key=lambda x: float(x.get("latest") or 0), reverse=True)
-    ims = ims[:channel_limit]
+    query_parts = ['"screamingface:v1"']
+    if since_days:
+        cutoff = (_dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(days=since_days)).strftime("%Y-%m-%d")
+        query_parts.append(f"after:{cutoff}")
 
+    r = slack_call("search.messages", token, cookie, {
+        "query": " ".join(query_parts),
+        "sort": "timestamp",
+        "sort_dir": "desc",
+        "count": str(min(max_results, 100)),
+    })
+    if not r.get("ok"):
+        raise RuntimeError(f"search.messages failed: {r.get('error')}")
+
+    matches = r.get("messages", {}).get("matches", [])
     found = []
-    for i, im in enumerate(ims):
-        channel = im.get("id")
-        if not channel:
+    for m in matches:
+        sender = m.get("user") or m.get("username")
+        if not include_self and sender == my_user_id:
             continue
-        if progress:
-            print(f"  scanning {i + 1}/{len(ims)}  {channel}", flush=True)
-        h = slack_call(
-            "conversations.history", token, cookie,
-            {"channel": channel, "limit": str(history_limit)},
-        )
-        if not h.get("ok"):
+        env = parse_envelope(m.get("text", ""))
+        if env is None:
             continue
-        for msg in h.get("messages", []):
-            sender = msg.get("user") or msg.get("bot_id")
-            if not include_self and sender == my_user_id:
-                continue
-            env = parse_envelope(msg.get("text", ""))
-            if env is None:
-                continue
-            found.append({
-                "channel": channel,
-                "ts": msg.get("ts"),
-                "sender": sender,
-                "envelope": env,
-            })
-    found.sort(key=lambda e: float(e["ts"]), reverse=True)
+        ch = m.get("channel")
+        channel_id = ch.get("id") if isinstance(ch, dict) else ch
+        found.append({
+            "channel": channel_id,
+            "ts": m.get("ts"),
+            "sender": sender,
+            "envelope": env,
+        })
     return found
 
 
@@ -501,10 +506,9 @@ def cli_inbox(args: argparse.Namespace) -> int:
     token, cookie = _auth(args.workspace)
     envelopes = fetch_inbox(
         token, cookie,
-        channel_limit=args.channels,
-        history_limit=args.history,
+        max_results=args.count,
         include_self=args.include_self,
-        progress=not args.quiet,
+        since_days=args.since_days,
     )
 
     state = _load_inbox_state()
@@ -578,15 +582,15 @@ def main(argv: list[str] | None = None) -> int:
     p_peers.add_argument("--limit", type=int, default=20, help="how many to list (default 20)")
     p_peers.set_defaults(func=cli_peers)
 
-    p_inbox = sub.add_parser("inbox", help="scan recent DMs for screamingface:v1 envelopes")
-    p_inbox.add_argument("--channels", type=int, default=50, help="how many recent IMs to scan (default 50)")
-    p_inbox.add_argument("--history", type=int, default=50, help="messages per channel to scan (default 50)")
+    p_inbox = sub.add_parser("inbox", help="find screamingface:v1 envelopes via Slack search")
+    p_inbox.add_argument("--count", type=int, default=100,
+                         help="max envelopes to return (default 100, Slack max per page)")
+    p_inbox.add_argument("--since-days", type=int, default=None,
+                         help="only envelopes from the last N days (server-side filter)")
     p_inbox.add_argument("--include-self", action="store_true",
                          help="include envelopes you sent (default: skipped)")
     p_inbox.add_argument("--show-known", action="store_true",
                          help="also list already-seen envelopes (default: just new ones)")
-    p_inbox.add_argument("--quiet", action="store_true",
-                         help="suppress per-channel progress output")
     p_inbox.set_defaults(func=cli_inbox)
 
     p_whoami = sub.add_parser("whoami", help="print authenticated Slack identity")
