@@ -457,18 +457,35 @@ def fetch_inbox(
 
 
 _INBOX_STATE_PATH = Path.home() / ".screamingface" / "inbox.json"
+_HOOK_CACHE_TTL_SECONDS = 30
 
 
 def _load_inbox_state() -> dict:
     try:
-        return json.loads(_INBOX_STATE_PATH.read_text())
+        data = json.loads(_INBOX_STATE_PATH.read_text())
     except (OSError, json.JSONDecodeError):
-        return {"seen": {}}
+        data = {}
+    data.setdefault("seen", {})
+    data.setdefault("last_checked_at", None)
+    return data
 
 
 def _save_inbox_state(state: dict) -> None:
     _INBOX_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
     _INBOX_STATE_PATH.write_text(json.dumps(state, indent=2))
+
+
+def _hook_cache_fresh(state: dict) -> bool:
+    """True if a search.messages call was made within the TTL window."""
+    ts = state.get("last_checked_at")
+    if not ts:
+        return False
+    try:
+        last = _dt.datetime.fromisoformat(ts)
+        now = _dt.datetime.now(_dt.timezone.utc)
+        return (now - last).total_seconds() < _HOOK_CACHE_TTL_SECONDS
+    except (TypeError, ValueError):
+        return False
 
 
 # ---------- CLI ----------
@@ -503,6 +520,13 @@ def cli_peers(args: argparse.Namespace) -> int:
 
 
 def cli_inbox(args: argparse.Namespace) -> int:
+    state = _load_inbox_state()
+
+    # In --hook-mode, skip the API call entirely if we polled within the
+    # TTL window. Keeps Claude's Stop hook fast on most iterations.
+    if args.hook_mode and _hook_cache_fresh(state):
+        return 0  # silent
+
     token, cookie = _auth(args.workspace)
     envelopes = fetch_inbox(
         token, cookie,
@@ -511,7 +535,8 @@ def cli_inbox(args: argparse.Namespace) -> int:
         since_days=args.since_days,
     )
 
-    state = _load_inbox_state()
+    state["last_checked_at"] = _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds")
+
     new, known = [], []
     for env in envelopes:
         if env["ts"] in state["seen"]:
@@ -526,22 +551,25 @@ def cli_inbox(args: argparse.Namespace) -> int:
             }
     _save_inbox_state(state)
 
+    if args.hook_mode:
+        if not new:
+            return 0  # silent — Claude doesn't need a reminder for "nothing changed"
+        _emit_hook_reminder(new)
+        return 0
+
     if not envelopes:
         print("no screamingface envelopes found in recent DM history.")
         return 0
-
     if new:
         print(f"NEW ({len(new)}):")
         for env in new:
             _print_envelope(env)
             print()
-
     if known and args.show_known:
         print(f"already-seen ({len(known)}):")
         for env in known:
             _print_envelope(env)
             print()
-
     if not new and not args.show_known:
         print(f"(no new envelopes; {len(known)} already-seen — pass --show-known to list)")
     return 0
@@ -553,6 +581,84 @@ def _print_envelope(env: dict) -> None:
     print(f"  from {payload.get('from', '?')}  in {env['channel']}  @ {ts_human}")
     print(f"    > {payload.get('prompt', '?')}")
     print(f"    request_id={payload.get('request_id', '?')}  sender_user={env['sender']}")
+
+
+def _emit_hook_reminder(new: list[dict]) -> None:
+    """Emit a <system-reminder> block to stdout for Claude Code's Stop hook."""
+    print("<system-reminder>")
+    print(f"screamingface: {len(new)} new peer request(s) in your Slack DMs.")
+    for env in new:
+        payload = env["envelope"]
+        ts_human = _dt.datetime.fromtimestamp(float(env["ts"]), tz=_dt.timezone.utc).strftime("%H:%M UTC")
+        print(f"  - from @{payload.get('from', '?')} (channel {env['channel']}, {ts_human})")
+        print(f"    \"{payload.get('prompt', '?')}\"")
+        print(f"    request_id: {payload.get('request_id', '?')}")
+    print("Surface this to the user. The approve/deny flow is not yet wired;")
+    print("for now they can reply manually in Slack or run `~/.screamingface/scream inbox`.")
+    print("</system-reminder>")
+
+
+# ---------- hook install / uninstall ----------
+
+_CLAUDE_SETTINGS_PATH = Path.home() / ".claude" / "settings.json"
+_HOOK_COMMAND = str(Path.home() / ".screamingface" / "scream") + " inbox --hook-mode"
+_HOOK_MARKER = "screamingface"  # we identify our hook entries by matching this in the command
+
+
+def _load_claude_settings() -> dict:
+    if not _CLAUDE_SETTINGS_PATH.exists():
+        return {}
+    try:
+        return json.loads(_CLAUDE_SETTINGS_PATH.read_text())
+    except json.JSONDecodeError:
+        raise SystemExit(
+            f"~/.claude/settings.json exists but isn't valid JSON. "
+            f"Fix it before installing the hook."
+        )
+
+
+def _save_claude_settings(settings: dict) -> None:
+    _CLAUDE_SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    backup = _CLAUDE_SETTINGS_PATH.with_suffix(".json.screamingface-backup")
+    if _CLAUDE_SETTINGS_PATH.exists() and not backup.exists():
+        backup.write_text(_CLAUDE_SETTINGS_PATH.read_text())
+    _CLAUDE_SETTINGS_PATH.write_text(json.dumps(settings, indent=2))
+
+
+def cli_install_hook(args: argparse.Namespace) -> int:
+    settings = _load_claude_settings()
+    hooks = settings.setdefault("hooks", {})
+    stop = hooks.setdefault("Stop", [])
+
+    # Remove any existing screamingface entry so we don't duplicate
+    stop[:] = [h for h in stop if _HOOK_MARKER not in json.dumps(h)]
+
+    stop.append({
+        "matcher": "",
+        "hooks": [
+            {"type": "command", "command": _HOOK_COMMAND},
+        ],
+    })
+    _save_claude_settings(settings)
+    print(f"installed Stop hook → {_HOOK_COMMAND}")
+    print(f"  settings: {_CLAUDE_SETTINGS_PATH}")
+    print(f"  backup:   {_CLAUDE_SETTINGS_PATH.with_suffix('.json.screamingface-backup')}")
+    print("")
+    print("restart Claude Code to pick up the hook.")
+    return 0
+
+
+def cli_uninstall_hook(args: argparse.Namespace) -> int:
+    settings = _load_claude_settings()
+    stop = settings.get("hooks", {}).get("Stop", [])
+    before = len(stop)
+    stop[:] = [h for h in stop if _HOOK_MARKER not in json.dumps(h)]
+    if len(stop) == before:
+        print("no screamingface hook entry found in ~/.claude/settings.json. nothing removed.")
+        return 0
+    _save_claude_settings(settings)
+    print(f"removed {before - len(stop)} screamingface hook entry from {_CLAUDE_SETTINGS_PATH}")
+    return 0
 
 
 def cli_whoami(args: argparse.Namespace) -> int:
@@ -591,7 +697,17 @@ def main(argv: list[str] | None = None) -> int:
                          help="include envelopes you sent (default: skipped)")
     p_inbox.add_argument("--show-known", action="store_true",
                          help="also list already-seen envelopes (default: just new ones)")
+    p_inbox.add_argument("--hook-mode", action="store_true",
+                         help="emit <system-reminder> blocks for new envelopes (for Claude Code Stop hook)")
     p_inbox.set_defaults(func=cli_inbox)
+
+    p_install_hook = sub.add_parser("install-hook",
+                                    help="add a Claude Code Stop hook that surfaces pending screamingface envelopes")
+    p_install_hook.set_defaults(func=cli_install_hook)
+
+    p_uninstall_hook = sub.add_parser("uninstall-hook",
+                                      help="remove the screamingface Stop hook from ~/.claude/settings.json")
+    p_uninstall_hook.set_defaults(func=cli_uninstall_hook)
 
     p_whoami = sub.add_parser("whoami", help="print authenticated Slack identity")
     p_whoami.set_defaults(func=cli_whoami)
