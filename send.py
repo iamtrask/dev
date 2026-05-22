@@ -364,10 +364,21 @@ def build_request_blocks(prompt: str, sender: str) -> tuple[list, str]:
         f'a question for your Claude: "{prompt}"  '
         f"·  screamingface:v1 {json.dumps(payload, separators=(',', ':'))}"
     )
+
+    # Short single-line prompts read nicely as a blockquote; multi-line or
+    # code-bearing prompts need to be embedded raw so Slack's mrkdwn (incl
+    # code blocks) renders correctly. Inside a blockquote Slack flattens
+    # code fences to plain text.
+    if "\n" in prompt or "```" in prompt:
+        prompt_md = prompt
+    else:
+        prompt_md = f"> {prompt}"
+
     blocks = [
         {"type": "section", "text": {"type": "mrkdwn", "text": (
             "*a question for your Claude*\n"
-            f"> {prompt}\n"
+            "\n"
+            f"{prompt_md}\n"
             "\n"
             f"_if you don't have {BRAND_EMOJI} installed, copy-paste this into claude:_"
         )}},
