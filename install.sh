@@ -26,16 +26,26 @@ for tool in security openssl sqlite3; do
   fi
 done
 
-# 4) prepare install dir (payload TBD)
+# 4) fetch payload
 mkdir -p "$INSTALL_DIR"
+echo "screamingface → $INSTALL_DIR"
+echo "  fetching send.py"
+curl -fsSL "$REPO_RAW/send.py" -o "$INSTALL_DIR/send.py"
+echo "  fetching scream"
+curl -fsSL "$REPO_RAW/scream"  -o "$INSTALL_DIR/scream"
+chmod +x "$INSTALL_DIR/scream"
 
 # 5) report
 PY_VERSION="$(python3 -c 'import sys; print(sys.version.split()[0])')"
 echo ""
-echo "✓ screamingface placeholder install ok."
-echo "  install dir: $INSTALL_DIR"
-echo "  python3:     $PY_VERSION"
-echo "  (payload not yet shipped; this is a staging-URL probe.)"
+echo "✓ installed. python3 = $PY_VERSION"
 echo ""
-echo "  to reset/uninstall:"
+echo "  try it:"
+echo "    $INSTALL_DIR/scream whoami"
+echo "    $INSTALL_DIR/scream peers --limit 5"
+echo ""
+echo "  add to PATH (optional):"
+echo "    ln -s $INSTALL_DIR/scream /usr/local/bin/scream"
+echo ""
+echo "  reset / uninstall:"
 echo "    curl -fsSL https://raw.githubusercontent.com/iamtrask/dev/main/uninstall.sh | bash"

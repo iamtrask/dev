@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# scream — thin wrapper for screamingface's send.py CLI.
+# usage: scream <subcommand> [args...]
+#   scream ask <channel-id> "<prompt>"
+#   scream peers [--limit N]
+#   scream whoami
+exec python3 "$(dirname "$0")/send.py" "$@"
