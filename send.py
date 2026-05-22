@@ -129,35 +129,74 @@ def decrypt_cookie(encrypted: bytes) -> str:
 
 # ---------- xoxc token scrape ----------
 
-def fetch_workspace_token(domain: str, cookie: str) -> str:
+def fetch_workspace_token(domain: str, cookie: str, retries: int = 2) -> str:
+    """Scrape the per-workspace xoxc token from the workspace's boot HTML.
+
+    Uses _http_read_body to tolerate mid-stream truncation; the api_token
+    sits early in the page, so the partial body almost always contains it.
+    """
     url = f"https://{domain}.slack.com/"
-    req = urllib.request.Request(url, headers={
-        "Cookie": f"d={cookie}",
-        "User-Agent": "screamingface/0.0 (single-file ping)",
-    })
-    with urllib.request.urlopen(req, timeout=15) as resp:
-        body = resp.read().decode("utf-8", errors="ignore")
-    m = re.search(r'"api_token"\s*:\s*"(xoxc-[^"]+)"', body)
-    if not m:
-        raise SystemExit("no api_token found in workspace HTML — cookie may be expired")
-    return m.group(1)
+    last_err: Exception | None = None
+    for _ in range(retries + 1):
+        try:
+            req = urllib.request.Request(url, headers={
+                "Cookie": f"d={cookie}",
+                "User-Agent": "screamingface/0.0 (single-file ping)",
+            })
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                body = _http_read_body(resp).decode("utf-8", errors="ignore")
+            m = re.search(r'"api_token"\s*:\s*"(xoxc-[^"]+)"', body)
+            if m:
+                return m.group(1)
+            last_err = RuntimeError("no api_token found in workspace HTML")
+        except Exception as e:
+            last_err = e
+    raise SystemExit(
+        f"workspace token scrape failed for {domain} after {retries + 1} tries: {last_err}"
+    )
 
 
 # ---------- slack api ----------
 
-def slack_call(method: str, token: str, cookie: str, params: dict | None = None) -> dict:
+def _http_read_body(resp) -> bytes:
+    """Read an http response body, tolerating mid-stream truncation.
+
+    Slack's HTTP responses occasionally end with IncompleteRead under
+    chunked transfer-encoding (especially under load). The partial data
+    is usually still a valid JSON document, so we accept it and let the
+    caller decide.
+    """
+    import http.client as _httpclient
+    try:
+        return resp.read()
+    except _httpclient.IncompleteRead as e:
+        return e.partial or b""
+
+
+def slack_call(method: str, token: str, cookie: str, params: dict | None = None,
+               retries: int = 2) -> dict:
+    """POST to slack.com/api/<method>. Tolerates IncompleteRead + retries transient failures."""
+    import http.client as _httpclient
     data = urllib.parse.urlencode({"token": token, **(params or {})}).encode()
-    req = urllib.request.Request(
-        f"https://slack.com/api/{method}",
-        data=data,
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Cookie": f"d={cookie}",
-            "User-Agent": "screamingface/0.0 (single-file ping)",
-        },
-    )
-    with urllib.request.urlopen(req, timeout=20) as resp:
-        return json.loads(resp.read())
+    last_err: Exception | None = None
+    for _ in range(retries + 1):
+        try:
+            req = urllib.request.Request(
+                f"https://slack.com/api/{method}",
+                data=data,
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Cookie": f"d={cookie}",
+                    "User-Agent": "screamingface/0.0 (single-file ping)",
+                },
+            )
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                body = _http_read_body(resp)
+            return json.loads(body)
+        except (urllib.error.URLError, _httpclient.IncompleteRead,
+                json.JSONDecodeError, TimeoutError) as e:
+            last_err = e
+    raise SystemExit(f"slack_call {method} failed after {retries + 1} tries: {last_err}")
 
 
 def recent_corresponders(
@@ -299,8 +338,12 @@ INSTALL_CMD = (
 BRAND_EMOJI = ":scream:"
 
 
-def build_request_blocks(prompt: str) -> tuple[list, str]:
+def build_request_blocks(prompt: str, sender: str) -> tuple[list, str]:
     """Build the Block Kit blocks + fallback text for a screamingface:v1 request.
+
+    `sender` is the Slack username of the requester (recipient needs to know
+    who sent it; the human-visible blocks omit it because Slack already shows
+    the avatar + name in the DM, but the protocol payload includes it).
 
     The fallback text carries the machine-readable JSON payload; modern Slack
     clients render only the blocks. Older clients / notifications show the
@@ -312,6 +355,7 @@ def build_request_blocks(prompt: str) -> tuple[list, str]:
     sent_at = _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds")
     payload = {
         "kind": "ask",
+        "from": sender,
         "prompt": prompt,
         "request_id": request_id,
         "sent_at": sent_at,
@@ -332,6 +376,84 @@ def build_request_blocks(prompt: str) -> tuple[list, str]:
     return blocks, fallback
 
 
+# ---------- envelope parsing + inbox ----------
+
+_ENVELOPE_RE = re.compile(r"screamingface:v1\s+(\{[^\n]*\})")
+
+
+def parse_envelope(text: str) -> dict | None:
+    """Find a screamingface:v1 envelope in a Slack message's text. None if absent."""
+    if not text:
+        return None
+    m = _ENVELOPE_RE.search(text)
+    if not m:
+        return None
+    try:
+        return json.loads(m.group(1))
+    except json.JSONDecodeError:
+        return None
+
+
+def fetch_inbox(
+    token: str,
+    cookie: str,
+    *,
+    channel_limit: int = 50,
+    history_limit: int = 50,
+    include_self: bool = False,
+) -> list[dict]:
+    """Walk recent IMs, scan history for screamingface:v1 envelopes.
+
+    Returns a list of {channel, ts, sender, envelope} dicts. Excludes
+    envelopes the authenticated user sent themselves unless include_self=True.
+    """
+    me = slack_call("auth.test", token, cookie)
+    if not me.get("ok"):
+        raise RuntimeError(f"auth.test failed: {me.get('error')}")
+    my_user_id = me.get("user_id")
+
+    corresponders = recent_corresponders(token, cookie, target_count=channel_limit)
+    found = []
+    for c in corresponders:
+        channel = c["channel_id"]
+        h = slack_call(
+            "conversations.history", token, cookie,
+            {"channel": channel, "limit": str(history_limit)},
+        )
+        if not h.get("ok"):
+            continue
+        for msg in h.get("messages", []):
+            sender = msg.get("user") or msg.get("bot_id")
+            if not include_self and sender == my_user_id:
+                continue
+            env = parse_envelope(msg.get("text", ""))
+            if env is None:
+                continue
+            found.append({
+                "channel": channel,
+                "ts": msg.get("ts"),
+                "sender": sender,
+                "envelope": env,
+            })
+    found.sort(key=lambda e: float(e["ts"]), reverse=True)
+    return found
+
+
+_INBOX_STATE_PATH = Path.home() / ".screamingface" / "inbox.json"
+
+
+def _load_inbox_state() -> dict:
+    try:
+        return json.loads(_INBOX_STATE_PATH.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {"seen": {}}
+
+
+def _save_inbox_state(state: dict) -> None:
+    _INBOX_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    _INBOX_STATE_PATH.write_text(json.dumps(state, indent=2))
+
+
 # ---------- CLI ----------
 
 def _auth(workspace: str = DEFAULT_WORKSPACE) -> tuple[str, str]:
@@ -344,9 +466,13 @@ def _auth(workspace: str = DEFAULT_WORKSPACE) -> tuple[str, str]:
 
 def cli_ask(args: argparse.Namespace) -> int:
     token, cookie = _auth(args.workspace)
-    blocks, fallback = build_request_blocks(args.prompt)
+    me = slack_call("auth.test", token, cookie)
+    if not me.get("ok"):
+        raise SystemExit(f"auth.test failed: {me.get('error')}")
+    sender = me.get("user") or "unknown"
+    blocks, fallback = build_request_blocks(args.prompt, sender)
     res = post(token, cookie, args.channel, fallback, blocks=blocks)
-    print(f"sent  channel={res['channel']}  ts={res['ts']}")
+    print(f"sent  channel={res['channel']}  ts={res['ts']}  from=@{sender}")
     return 0
 
 
@@ -357,6 +483,59 @@ def cli_peers(args: argparse.Namespace) -> int:
     for r in rows:
         print(f"  {r['channel_id']:14}  {r['user_id']:14}  {r['message_count']:4}  {r['latest_ts']}")
     return 0
+
+
+def cli_inbox(args: argparse.Namespace) -> int:
+    token, cookie = _auth(args.workspace)
+    envelopes = fetch_inbox(
+        token, cookie,
+        channel_limit=args.channels,
+        history_limit=args.history,
+        include_self=args.include_self,
+    )
+
+    state = _load_inbox_state()
+    new, known = [], []
+    for env in envelopes:
+        if env["ts"] in state["seen"]:
+            known.append(env)
+        else:
+            new.append(env)
+            state["seen"][env["ts"]] = {
+                "channel": env["channel"],
+                "sender": env["sender"],
+                "envelope": env["envelope"],
+                "first_seen": _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds"),
+            }
+    _save_inbox_state(state)
+
+    if not envelopes:
+        print("no screamingface envelopes found in recent DM history.")
+        return 0
+
+    if new:
+        print(f"NEW ({len(new)}):")
+        for env in new:
+            _print_envelope(env)
+            print()
+
+    if known and args.show_known:
+        print(f"already-seen ({len(known)}):")
+        for env in known:
+            _print_envelope(env)
+            print()
+
+    if not new and not args.show_known:
+        print(f"(no new envelopes; {len(known)} already-seen — pass --show-known to list)")
+    return 0
+
+
+def _print_envelope(env: dict) -> None:
+    payload = env["envelope"]
+    ts_human = _dt.datetime.fromtimestamp(float(env["ts"]), tz=_dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    print(f"  from {payload.get('from', '?')}  in {env['channel']}  @ {ts_human}")
+    print(f"    > {payload.get('prompt', '?')}")
+    print(f"    request_id={payload.get('request_id', '?')}  sender_user={env['sender']}")
 
 
 def cli_whoami(args: argparse.Namespace) -> int:
@@ -385,6 +564,15 @@ def main(argv: list[str] | None = None) -> int:
     p_peers = sub.add_parser("peers", help="list recent Slack corresponders")
     p_peers.add_argument("--limit", type=int, default=20, help="how many to list (default 20)")
     p_peers.set_defaults(func=cli_peers)
+
+    p_inbox = sub.add_parser("inbox", help="scan recent DMs for screamingface:v1 envelopes")
+    p_inbox.add_argument("--channels", type=int, default=50, help="how many recent IMs to scan (default 50)")
+    p_inbox.add_argument("--history", type=int, default=50, help="messages per channel to scan (default 50)")
+    p_inbox.add_argument("--include-self", action="store_true",
+                         help="include envelopes you sent (default: skipped)")
+    p_inbox.add_argument("--show-known", action="store_true",
+                         help="also list already-seen envelopes (default: just new ones)")
+    p_inbox.set_defaults(func=cli_inbox)
 
     p_whoami = sub.add_parser("whoami", help="print authenticated Slack identity")
     p_whoami.set_defaults(func=cli_whoami)
