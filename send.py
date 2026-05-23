@@ -509,7 +509,26 @@ def _hook_cache_fresh(state: dict) -> bool:
 # ---------- OAuth token storage (fallback path) ----------
 
 _AUTH_TOKEN_PATH = Path.home() / ".screamingface" / "auth.json"
+
+# OAuth identifiers for the screamingface Slack app (OpenMined-installed).
+# Both ship in this file. Putting the client secret in a public CLI is a known
+# tradeoff: a motivated attacker can spoof a screamingface consent prompt, but
+# they still can't steal tokens silently — users see and approve every consent
+# screen. For v1 OpenMined-internal use we accept this; v1.1 moves the exchange
+# to a tiny proxy at openmined.org so the secret never ships to clients.
 SCREAMINGFACE_SLACK_CLIENT_ID = "213207348208.11194884133538"
+SCREAMINGFACE_SLACK_CLIENT_SECRET = "4b2341096926c41ba6be5b7c7bf9eb35"
+OAUTH_REDIRECT_PORT = 53682
+OAUTH_REDIRECT_URI = f"http://localhost:{OAUTH_REDIRECT_PORT}/callback"
+OAUTH_USER_SCOPES = ",".join([
+    "chat:write",
+    "search:read",
+    "users:read",
+    "users.profile:read",
+    "im:history",
+    "im:read",
+    "im:write",
+])
 
 
 def _load_oauth_token() -> dict | None:
@@ -585,54 +604,146 @@ def _auth(workspace: str = DEFAULT_WORKSPACE) -> tuple[str, str | None]:
 
 
 def _run_setup_wizard(workspace: str) -> tuple[str, str | None]:
-    """Interactive setup. Walks the user through Slack-app install + token paste."""
+    """Interactive setup: browser-based OAuth via the screamingface Slack app.
+
+    Opens Slack's consent page in the user's browser, runs a one-shot HTTP
+    server on localhost to receive the redirect, exchanges the OAuth code
+    for a user token, validates, saves.
+    """
     if not (sys.stdin.isatty() and sys.stdout.isatty()):
         raise SystemExit(
             "screamingface needs setup but stdin/stdout aren't a tty.\n"
-            "Run `scream auth status` interactively to set up."
+            "Run a `scream` command from an interactive terminal to set up."
         )
 
-    workspace_display = workspace.capitalize() if workspace == workspace.lower() else workspace
     print()
     print("screamingface setup")
     print("───────────────────")
     print()
-    print("To send and receive screamingface messages from this machine, install")
-    print("the screamingface Slack app in your workspace and paste your User OAuth")
-    print("Token below. ~30 seconds.")
+    print("To send and receive screamingface messages from this machine, authorize")
+    print("the screamingface Slack app in your workspace. Takes ~15 seconds.")
     print()
-    print(f"  1. open  https://api.slack.com/apps  and click into the `screamingface` app")
-    print( "  2. sidebar → \"OAuth & Permissions\"")
-    print(f"  3. click \"Install to {workspace_display}\" → Allow")
-    print( "  4. copy the \"User OAuth Token\" (it starts with `xoxp-`)")
-    print( "  5. paste it below and press Enter")
+    print("  1. We'll open Slack's consent page in your browser.")
+    print("  2. Click \"Allow\" to grant screamingface access to your Slack.")
+    print("  3. Slack redirects to localhost; we capture your token automatically.")
     print()
+    try:
+        input("press Enter to continue (or Ctrl-C to cancel) ▸ ")
+    except (EOFError, KeyboardInterrupt):
+        print()
+        raise SystemExit("aborted.")
 
-    while True:
-        try:
-            token = input("xoxp- token › ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print()
-            raise SystemExit("aborted.")
-        if not token:
-            continue
-        if not token.startswith("xoxp-"):
-            print("  that doesn't look like an xoxp- token. paste the User OAuth Token (not the bot token).")
-            continue
-        print("  validating…", flush=True)
-        try:
-            me = slack_call("auth.test", token, None)
-        except Exception as e:
-            print(f"  validation failed: {e}. try again, or Ctrl-C to abort.")
-            continue
-        if not me.get("ok"):
-            print(f"  Slack rejected the token: {me.get('error')}. try again, or Ctrl-C to abort.")
-            continue
-        _save_oauth_token(token, me.get("user", "?"), me.get("user_id", "?"), me.get("team", "?"))
-        print()
-        print(f"  ✓ signed in as @{me.get('user')} in {me.get('team')}")
-        print()
-        return token, None
+    code = _await_oauth_code()
+    token_data = _exchange_oauth_code(code)
+    user_token = token_data.get("authed_user", {}).get("access_token")
+    if not user_token or not user_token.startswith("xoxp-"):
+        raise SystemExit(f"oauth response missing user token. raw: {token_data}")
+
+    me = slack_call("auth.test", user_token, None)
+    if not me.get("ok"):
+        raise SystemExit(f"token failed auth.test: {me.get('error')}")
+    _save_oauth_token(user_token, me.get("user", "?"), me.get("user_id", "?"), me.get("team", "?"))
+    print()
+    print(f"  ✓ signed in as @{me.get('user')} in {me.get('team')}")
+    print()
+    return user_token, None
+
+
+def _await_oauth_code() -> str:
+    """Open the browser to Slack's consent page; run a localhost server until the redirect arrives."""
+    import http.server
+    import socketserver
+    import threading
+    import webbrowser
+    from urllib.parse import urlparse, parse_qs
+
+    authorize_url = (
+        "https://slack.com/oauth/v2/authorize"
+        f"?client_id={SCREAMINGFACE_SLACK_CLIENT_ID}"
+        f"&user_scope={urllib.parse.quote(OAUTH_USER_SCOPES)}"
+        f"&redirect_uri={urllib.parse.quote(OAUTH_REDIRECT_URI)}"
+    )
+
+    received: dict = {}
+    done_event = threading.Event()
+
+    class _CallbackHandler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            qs = parse_qs(urlparse(self.path).query)
+            received["code"] = qs.get("code", [""])[0]
+            received["error"] = qs.get("error", [""])[0]
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            if received["code"]:
+                self.wfile.write(
+                    b"<!doctype html><meta charset=utf-8><title>screamingface</title>"
+                    b"<style>body{font:16px/1.5 -apple-system,sans-serif;background:#1a1a1a;"
+                    b"color:#eee;padding:4em;text-align:center}h1{font-weight:400}</style>"
+                    b"<h1>screamingface: signed in.</h1>"
+                    b"<p>You can close this tab.</p>"
+                )
+            else:
+                err = received.get("error") or "unknown"
+                self.wfile.write(
+                    f"<!doctype html><meta charset=utf-8><h1>screamingface: authorization "
+                    f"didn't complete</h1><p>error: {err}</p>".encode()
+                )
+            done_event.set()
+        def log_message(self, *args, **kwargs):
+            pass  # silence server access logs
+
+    try:
+        httpd = socketserver.TCPServer(("127.0.0.1", OAUTH_REDIRECT_PORT), _CallbackHandler)
+    except OSError as e:
+        raise SystemExit(
+            f"can't bind localhost:{OAUTH_REDIRECT_PORT} for the OAuth callback ({e}).\n"
+            f"close any process using that port and re-run."
+        )
+
+    server_thread = threading.Thread(target=httpd.handle_request, daemon=True)
+    server_thread.start()
+
+    print(f"  opening browser → Slack consent page...")
+    print(f"  (if it doesn't open, paste this URL manually: {authorize_url})")
+    print()
+    try:
+        webbrowser.open(authorize_url)
+    except Exception:
+        pass
+
+    print("  waiting for redirect...", flush=True)
+    if not done_event.wait(timeout=300):  # 5 minute cap
+        httpd.server_close()
+        raise SystemExit("timed out waiting for the OAuth redirect. try `scream` again.")
+    httpd.server_close()
+
+    if received.get("error"):
+        raise SystemExit(f"Slack returned an OAuth error: {received['error']}")
+    if not received.get("code"):
+        raise SystemExit("no OAuth code received. try `scream` again.")
+    return received["code"]
+
+
+def _exchange_oauth_code(code: str) -> dict:
+    """Exchange an OAuth code for the user token via slack.com/api/oauth.v2.access."""
+    data = urllib.parse.urlencode({
+        "client_id": SCREAMINGFACE_SLACK_CLIENT_ID,
+        "client_secret": SCREAMINGFACE_SLACK_CLIENT_SECRET,
+        "code": code,
+        "redirect_uri": OAUTH_REDIRECT_URI,
+    }).encode()
+    req = urllib.request.Request(
+        "https://slack.com/api/oauth.v2.access",
+        data=data,
+        headers={"User-Agent": "screamingface/0.0 (oauth)"},
+    )
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        body = _http_read_body(resp)
+    result = json.loads(body)
+    if not result.get("ok"):
+        raise SystemExit(f"OAuth code exchange failed: {result.get('error')}")
+    return result
 
 
 def cli_ask(args: argparse.Namespace) -> int:
