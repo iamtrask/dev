@@ -27,6 +27,7 @@ import os
 import re
 import secrets
 import sqlite3
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -34,6 +35,39 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 from shutil import copyfile
+
+
+# ---------- SSL ----------
+
+_SSL_CONTEXT: ssl.SSLContext | None = None
+
+
+def _ssl_context() -> ssl.SSLContext:
+    """Return a cached SSL context for all HTTPS calls.
+
+    macOS python.org installers ship without a CA bundle wired to the system
+    trust store, so Python's default `create_default_context()` can fail with
+    CERTIFICATE_VERIFY_FAILED. We point at macOS's system bundle explicitly
+    when we can find it; fall back to Python's default otherwise.
+    """
+    global _SSL_CONTEXT
+    if _SSL_CONTEXT is not None:
+        return _SSL_CONTEXT
+    candidates = [
+        "/etc/ssl/cert.pem",                       # macOS system bundle
+        "/usr/local/etc/openssl@3/cert.pem",       # Homebrew openssl 3
+        "/usr/local/etc/openssl/cert.pem",         # Homebrew openssl 1.1
+        "/opt/homebrew/etc/openssl@3/cert.pem",    # Apple Silicon Homebrew
+    ]
+    for cafile in candidates:
+        if os.path.exists(cafile):
+            try:
+                _SSL_CONTEXT = ssl.create_default_context(cafile=cafile)
+                return _SSL_CONTEXT
+            except Exception:
+                continue
+    _SSL_CONTEXT = ssl.create_default_context()
+    return _SSL_CONTEXT
 
 
 # ---------- cookie ----------
@@ -143,7 +177,7 @@ def fetch_workspace_token(domain: str, cookie: str, retries: int = 2) -> str:
                 "Cookie": f"d={cookie}",
                 "User-Agent": "screamingface/0.0 (single-file ping)",
             })
-            with urllib.request.urlopen(req, timeout=20) as resp:
+            with urllib.request.urlopen(req, timeout=20, context=_ssl_context()) as resp:
                 body = _http_read_body(resp).decode("utf-8", errors="ignore")
             m = re.search(r'"api_token"\s*:\s*"(xoxc-[^"]+)"', body)
             if m:
@@ -197,7 +231,7 @@ def slack_call(method: str, token: str, cookie: str | None, params: dict | None 
                 data=data,
                 headers=headers,
             )
-            with urllib.request.urlopen(req, timeout=20) as resp:
+            with urllib.request.urlopen(req, timeout=20, context=_ssl_context()) as resp:
                 body = _http_read_body(resp)
             return json.loads(body)
         except (urllib.error.URLError, _httpclient.IncompleteRead,
@@ -738,7 +772,7 @@ def _exchange_oauth_code(code: str) -> dict:
         data=data,
         headers={"User-Agent": "screamingface/0.0 (oauth)"},
     )
-    with urllib.request.urlopen(req, timeout=20) as resp:
+    with urllib.request.urlopen(req, timeout=20, context=_ssl_context()) as resp:
         body = _http_read_body(resp)
     result = json.loads(body)
     if not result.get("ok"):
