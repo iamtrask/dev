@@ -173,22 +173,29 @@ def _http_read_body(resp) -> bytes:
         return e.partial or b""
 
 
-def slack_call(method: str, token: str, cookie: str, params: dict | None = None,
+def slack_call(method: str, token: str, cookie: str | None, params: dict | None = None,
                retries: int = 2) -> dict:
-    """POST to slack.com/api/<method>. Tolerates IncompleteRead + retries transient failures."""
+    """POST to slack.com/api/<method>. Tolerates IncompleteRead + retries transient failures.
+
+    `cookie` is the d-cookie used alongside xoxc workspace tokens (the cookie
+    path). When using an OAuth user token (xoxp-...) cookie should be None;
+    no Cookie header is sent in that case.
+    """
     import http.client as _httpclient
     data = urllib.parse.urlencode({"token": token, **(params or {})}).encode()
     last_err: Exception | None = None
     for _ in range(retries + 1):
         try:
+            headers = {
+                "Authorization": f"Bearer {token}",
+                "User-Agent": "screamingface/0.0 (single-file ping)",
+            }
+            if cookie:
+                headers["Cookie"] = f"d={cookie}"
             req = urllib.request.Request(
                 f"https://slack.com/api/{method}",
                 data=data,
-                headers={
-                    "Authorization": f"Bearer {token}",
-                    "Cookie": f"d={cookie}",
-                    "User-Agent": "screamingface/0.0 (single-file ping)",
-                },
+                headers=headers,
             )
             with urllib.request.urlopen(req, timeout=20) as resp:
                 body = _http_read_body(resp)
@@ -499,14 +506,133 @@ def _hook_cache_fresh(state: dict) -> bool:
         return False
 
 
+# ---------- OAuth token storage (fallback path) ----------
+
+_AUTH_TOKEN_PATH = Path.home() / ".screamingface" / "auth.json"
+SCREAMINGFACE_SLACK_CLIENT_ID = "213207348208.11194884133538"
+
+
+def _load_oauth_token() -> dict | None:
+    """Returns the stored OAuth user-token dict, or None if absent / invalid."""
+    if not _AUTH_TOKEN_PATH.exists():
+        return None
+    try:
+        data = json.loads(_AUTH_TOKEN_PATH.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    token = data.get("user_token")
+    if not isinstance(token, str) or not token.startswith("xoxp-"):
+        return None
+    return data
+
+
+def _save_oauth_token(token: str, user: str, user_id: str, team: str) -> None:
+    _AUTH_TOKEN_PATH.parent.mkdir(parents=True, exist_ok=True)
+    data = {
+        "user_token": token,
+        "user": user,
+        "user_id": user_id,
+        "team": team,
+        "saved_at": _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds"),
+    }
+    _AUTH_TOKEN_PATH.write_text(json.dumps(data, indent=2))
+    os.chmod(_AUTH_TOKEN_PATH, 0o600)
+
+
 # ---------- CLI ----------
 
-def _auth(workspace: str = DEFAULT_WORKSPACE) -> tuple[str, str]:
-    """One-shot: decrypt the cookie + scrape the xoxc token. Returns (token, cookie)."""
-    encrypted = read_encrypted_d_cookie()
-    cookie = decrypt_cookie(encrypted)
-    token = fetch_workspace_token(workspace, cookie)
-    return token, cookie
+class CookieAuthUnavailable(RuntimeError):
+    """Raised when cookie extraction fails for any reason (no Slack, MAS sandbox, etc)."""
+
+
+def _try_cookie_auth(workspace: str) -> tuple[str, str]:
+    """Attempt the cookie path. Raises CookieAuthUnavailable on any failure."""
+    try:
+        encrypted = read_encrypted_d_cookie()
+        cookie = decrypt_cookie(encrypted)
+        token = fetch_workspace_token(workspace, cookie)
+        return token, cookie
+    except SystemExit as e:
+        raise CookieAuthUnavailable(str(e)) from e
+    except Exception as e:
+        raise CookieAuthUnavailable(str(e)) from e
+
+
+def _auth(workspace: str = DEFAULT_WORKSPACE) -> tuple[str, str | None]:
+    """Resolve Slack credentials.
+
+    Order:
+      1. Stored OAuth token (set up via the wizard or `scream auth set-token`).
+      2. Cookie extraction (works zero-friction on direct-download macOS Slack).
+      3. Otherwise, run the interactive setup wizard if we're in a tty.
+
+    The cookie path is tried before the wizard because most users land here
+    with Slack desktop already logged in; only the cases where it can't work
+    (MAS sandbox, Linux/Windows, no Slack desktop) drop into setup.
+
+    Returns: (token, cookie). cookie is None when using OAuth.
+    """
+    oauth = _load_oauth_token()
+    if oauth:
+        return oauth["user_token"], None
+
+    try:
+        return _try_cookie_auth(workspace)
+    except CookieAuthUnavailable:
+        pass
+
+    return _run_setup_wizard(workspace)
+
+
+def _run_setup_wizard(workspace: str) -> tuple[str, str | None]:
+    """Interactive setup. Walks the user through Slack-app install + token paste."""
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        raise SystemExit(
+            "screamingface needs setup but stdin/stdout aren't a tty.\n"
+            "Run `scream auth status` interactively to set up."
+        )
+
+    workspace_display = workspace.capitalize() if workspace == workspace.lower() else workspace
+    print()
+    print("screamingface setup")
+    print("───────────────────")
+    print()
+    print("To send and receive screamingface messages from this machine, install")
+    print("the screamingface Slack app in your workspace and paste your User OAuth")
+    print("Token below. ~30 seconds.")
+    print()
+    print(f"  1. open  https://api.slack.com/apps  and click into the `screamingface` app")
+    print( "  2. sidebar → \"OAuth & Permissions\"")
+    print(f"  3. click \"Install to {workspace_display}\" → Allow")
+    print( "  4. copy the \"User OAuth Token\" (it starts with `xoxp-`)")
+    print( "  5. paste it below and press Enter")
+    print()
+
+    while True:
+        try:
+            token = input("xoxp- token › ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            raise SystemExit("aborted.")
+        if not token:
+            continue
+        if not token.startswith("xoxp-"):
+            print("  that doesn't look like an xoxp- token. paste the User OAuth Token (not the bot token).")
+            continue
+        print("  validating…", flush=True)
+        try:
+            me = slack_call("auth.test", token, None)
+        except Exception as e:
+            print(f"  validation failed: {e}. try again, or Ctrl-C to abort.")
+            continue
+        if not me.get("ok"):
+            print(f"  Slack rejected the token: {me.get('error')}. try again, or Ctrl-C to abort.")
+            continue
+        _save_oauth_token(token, me.get("user", "?"), me.get("user_id", "?"), me.get("team", "?"))
+        print()
+        print(f"  ✓ signed in as @{me.get('user')} in {me.get('team')}")
+        print()
+        return token, None
 
 
 def cli_ask(args: argparse.Namespace) -> int:
@@ -681,6 +807,71 @@ def cli_whoami(args: argparse.Namespace) -> int:
     return 0
 
 
+def cli_auth_set_token(args: argparse.Namespace) -> int:
+    """Store an OAuth user token. Validates via auth.test before saving."""
+    token = args.token.strip()
+    if not token.startswith("xoxp-"):
+        raise SystemExit(f"token must start with 'xoxp-' (user OAuth token). got: {token[:8]!r}...")
+    me = slack_call("auth.test", token, None)
+    if not me.get("ok"):
+        raise SystemExit(f"token validation failed: {me.get('error')}")
+    _save_oauth_token(token, me.get("user", "?"), me.get("user_id", "?"), me.get("team", "?"))
+    print(f"✓ OAuth token saved for @{me.get('user')} in {me.get('team')}")
+    print(f"  stored: {_AUTH_TOKEN_PATH} (chmod 600)")
+    print("  scream commands now use OAuth when the cookie path isn't available.")
+    return 0
+
+
+def cli_auth_status(args: argparse.Namespace) -> int:
+    """Show which auth path is active. Tests cookie path + OAuth token independently."""
+    print("screamingface auth status:")
+    print()
+
+    # Cookie path
+    print("  cookie path:")
+    try:
+        cookie_token, cookie = _try_cookie_auth(args.workspace)
+        me = slack_call("auth.test", cookie_token, cookie)
+        if me.get("ok"):
+            print(f"    ✓ working  @{me.get('user')} in {me.get('team')}")
+        else:
+            print(f"    × auth.test failed: {me.get('error')}")
+    except CookieAuthUnavailable as e:
+        print(f"    × unavailable: {e}")
+
+    print()
+
+    # OAuth path
+    print("  OAuth token:")
+    oauth = _load_oauth_token()
+    if oauth is None:
+        print("    × not configured")
+        print("      run:  scream auth set-token \"xoxp-...\"")
+    else:
+        try:
+            me = slack_call("auth.test", oauth["user_token"], None)
+            if me.get("ok"):
+                print(f"    ✓ working  @{me.get('user')} in {me.get('team')}")
+                print(f"    stored:    {_AUTH_TOKEN_PATH}")
+                print(f"    saved at:  {oauth.get('saved_at', '?')}")
+            else:
+                print(f"    × token rejected by auth.test: {me.get('error')}")
+        except Exception as e:
+            print(f"    × token check failed: {e}")
+    return 0
+
+
+def cli_auth_logout(args: argparse.Namespace) -> int:
+    """Remove the stored OAuth token."""
+    if not _AUTH_TOKEN_PATH.exists():
+        print("no OAuth token stored. nothing to remove.")
+        return 0
+    _AUTH_TOKEN_PATH.unlink()
+    print(f"✓ removed {_AUTH_TOKEN_PATH}")
+    print("  screamingface will now use the cookie path (if available).")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(
         prog="scream",
@@ -722,6 +913,20 @@ def main(argv: list[str] | None = None) -> int:
 
     p_whoami = sub.add_parser("whoami", help="print authenticated Slack identity")
     p_whoami.set_defaults(func=cli_whoami)
+
+    p_auth = sub.add_parser("auth", help="manage screamingface OAuth credentials (fallback when cookie path is unavailable)")
+    auth_sub = p_auth.add_subparsers(dest="auth_cmd", required=True)
+
+    p_auth_set = auth_sub.add_parser("set-token",
+                                     help="store an OAuth user token (xoxp-...) from the screamingface Slack app")
+    p_auth_set.add_argument("token", help="the User OAuth Token from your Slack app's OAuth & Permissions page")
+    p_auth_set.set_defaults(func=cli_auth_set_token)
+
+    p_auth_status = auth_sub.add_parser("status", help="show which auth path is active")
+    p_auth_status.set_defaults(func=cli_auth_status)
+
+    p_auth_logout = auth_sub.add_parser("logout", help="remove the stored OAuth token (falls back to cookie path)")
+    p_auth_logout.set_defaults(func=cli_auth_logout)
 
     args = p.parse_args(argv)
     return args.func(args)
